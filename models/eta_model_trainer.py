@@ -7,8 +7,8 @@ import pandas as pd
 from sklearn.compose import ColumnTransformer
 from sklearn.preprocessing import OneHotEncoder, StandardScaler
 from sklearn.pipeline import make_pipeline
-from sklearn.ensemble import RandomForestClassifier
-from sklearn.metrics import confusion_matrix
+from sklearn.neural_network import MLPRegressor
+from sklearn.metrics import mean_absolute_error
 from sklearn.model_selection import train_test_split
 from sklearn.utils import shuffle
 import duckdb
@@ -17,22 +17,21 @@ import pyarrow.dataset as ds
 from models.s3 import S3Client
 
 
-FEATURES_ORDER = ["hour", "dow", "num_bikes_available", "num_bikes_disabled", "num_docks_available", "num_docks_disabled", "minutes_bt_check"]
-TARGET = "bikes_a"
-CLASS_WEIGHT = {0: 1, 1: 500}
+FEATURES_ORDER = ["hour", "dow", "num_bikes_disabled", "num_docks_available", "num_docks_disabled"]
+TARGET = "minutes_bt_check"
 OHE_SLICE = [0, 1]
-SS_SLICE = slice(2,7)
+SS_SLICE = slice(2,8)
 TEST_SIZE = 0.1
 
 DATA_BASE_PATH = "silver/status/"
 DATA_DATE_TEMPLATE = "year=%Y/month=%-m/day=%-d"
 
-CURRENT_MODEL_KEY = "models/current_availability_model.txt"
+CURRENT_MODEL_KEY = "models/current_eta_model.txt"
 JOBLIB_COMPRESSION = ('lzma', 3)
 MODELS_BASE_PATH = "models/"
 MODELS_DATE_TEMPLATE = "year=%Y/month=%m/%d"
-MODELS_FILE_NAME = "_availability.joblib"
-METRICS_FILE_NAME = "_availability_metrics.joblib"
+MODELS_FILE_NAME = "_eta.joblib"
+METRICS_FILE_NAME = "_eta_metrics.joblib"
 
 BASE_TABLE_QUERY = """
 WITH base_status AS (select
@@ -66,9 +65,9 @@ SELECT
     ) as bikes_available,
 FROM
     base_status
-""".format(i, i) for i in range(1, 17, 3)])
+""".format(i, i) for i in range(1, 16)])
 
-class AvailabilityModelTrainer:
+class ETAModelTrainer:
     def __init__(self, features_order = FEATURES_ORDER, target = TARGET, ohe_slice = OHE_SLICE, ss_slice = SS_SLICE) -> None:
         self.features_order = features_order
         self.target = target
@@ -78,7 +77,7 @@ class AvailabilityModelTrainer:
         self.stations_pipelines = dict()
         self.stations_metrics = dict()
 
-    def create_dataset(self, current_date, training_period = 21) -> pd.DataFrame:
+    def create_dataset(self, current_date, training_period = 100) -> pd.DataFrame:
         temp_dir = tempfile.TemporaryDirectory()
         dates = pd.date_range(end=current_date, periods=training_period)
 
@@ -101,7 +100,7 @@ class AvailabilityModelTrainer:
             df_query = BASE_TABLE_QUERY.format(station_id) + LEAD_MINUTES_QUERY
             dfs_to_concat.append(con.execute(df_query).df())
         dataset_df = pd.concat(dfs_to_concat)
-        dataset_df[TARGET] = (dataset_df["bikes_available"]>0).astype(int)
+        dataset_df = dataset_df[(dataset_df["num_bikes_available"] == 0) & (dataset_df["bikes_available"] > 0)]
 
         temp_dir.cleanup()
         return dataset_df
@@ -111,15 +110,14 @@ class AvailabilityModelTrainer:
             self.train_station(station_id, data_set[data_set["station_id"] == station_id])
 
     def train_station(self, station_id, data_set) -> None:
-        station_pipeline = make_pipeline(
-            ColumnTransformer([("ohe",  OneHotEncoder(sparse=False), self.ohe_slice), ("ss",  StandardScaler(), self.ss_slice)]),
-            RandomForestClassifier(n_estimators=20, max_depth=50, class_weight=CLASS_WEIGHT))
+        station_pipeline = make_pipeline(ColumnTransformer([("ohe",  OneHotEncoder(sparse=False), [0, 1]), ("ss",  StandardScaler(), slice(2,5))]),
+            MLPRegressor((128, 128, 128)))
         data_set = data_set.dropna()
         X_train, X_test, y_train, y_test = train_test_split(data_set[self.features_order].values, data_set[self.target].values, test_size=TEST_SIZE, shuffle=False)
         X_train, y_train = shuffle(X_train, y_train)
         station_pipeline.fit(X_train, y_train)
         self.stations_pipelines[station_id] = station_pipeline
-        self.stations_metrics[station_id] = confusion_matrix(y_test, station_pipeline.predict(X_test), labels=[1, 0], normalize="true")
+        self.stations_metrics[station_id] = mean_absolute_error(y_test, station_pipeline.predict(X_test))
 
     def dump_stations_pipelines(self, date, current=False) -> None:
         model_key = MODELS_BASE_PATH + date.strftime(MODELS_DATE_TEMPLATE) + MODELS_FILE_NAME
