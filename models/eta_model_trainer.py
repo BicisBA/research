@@ -34,7 +34,7 @@ MODELS_FILE_NAME = "_eta.joblib"
 METRICS_FILE_NAME = "_eta_metrics.joblib"
 
 BASE_TABLE_QUERY = """
-WITH base_status AS (select
+WITH base_status AS (SELECT
     station_id,
     hour,
     num_bikes_available,
@@ -43,12 +43,14 @@ WITH base_status AS (select
     num_docks_disabled,
     status,
     make_timestamp(year, month, day, hour, minute, 0.0) as ts,
-from
+FROM
     status
-where
+WHERE
     station_id = {} and
-    status = 'IN_SERVICE')"""
-LEAD_MINUTES_QUERY = " UNION ".join(["""
+    status = 'IN_SERVICE'),
+status_by_minute AS ("""
+BASE_TABLE_QUERY += " UNION ".join([
+f"""
 SELECT
     station_id,
     hour,
@@ -57,15 +59,27 @@ SELECT
     num_bikes_disabled,
     num_docks_available,
     num_docks_disabled,
-    minute(lead(ts, {}) over (
+    minute(lead(ts, {i}) over (
         order by ts asc
     ) - ts)  as minutes_bt_check,
-    lead(num_bikes_available, {}) over (
+    lead(num_bikes_available, {i}) over (
         order by ts asc
     ) as bikes_available,
 FROM
     base_status
-""".format(i, i) for i in range(1, 16)])
+""" for i in range(1, 16)])
+BASE_TABLE_QUERY += """)
+SELECT station_id,
+    hour,
+    dow,
+    num_bikes_disabled,
+    num_docks_available,
+    num_docks_disabled,
+    minutes_bt_check
+FROM status_by_minute
+WHERE num_bikes_available = 0
+AND bikes_available > 0
+"""
 
 class ETAModelTrainer:
     def __init__(self, features_order = FEATURES_ORDER, target = TARGET, ohe_slice = OHE_SLICE, ss_slice = SS_SLICE) -> None:
@@ -97,10 +111,9 @@ class ETAModelTrainer:
         dfs_to_concat = []
 
         for station_id in station_ids:
-            df_query = BASE_TABLE_QUERY.format(station_id) + LEAD_MINUTES_QUERY
+            df_query = BASE_TABLE_QUERY.format(station_id)
             dfs_to_concat.append(con.execute(df_query).df())
         dataset_df = pd.concat(dfs_to_concat)
-        dataset_df = dataset_df[(dataset_df["num_bikes_available"] == 0) & (dataset_df["bikes_available"] > 0)]
 
         temp_dir.cleanup()
         return dataset_df
